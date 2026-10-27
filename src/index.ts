@@ -12,12 +12,13 @@ const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS ?? 20_000);
 const READY_TIMEOUT_MS = Number(process.env.READY_TIMEOUT_MS ?? 8_000);
 const MAX_TEXT_CHARS = Number(process.env.MAX_TEXT_CHARS ?? 80_000);
 const MAX_LINKS = Number(process.env.MAX_LINKS ?? 500);
-const MAX_CRAWL_PAGES = Number(process.env.MAX_CRAWL_PAGES ?? 50);
-const CRAWL_PAGE_TEXT_CHARS = Number(process.env.CRAWL_PAGE_TEXT_CHARS ?? 25_000);
-const MAX_CRAWL_TOTAL_CHARS = Number(process.env.MAX_CRAWL_TOTAL_CHARS ?? 300_000);
-const MAX_CRAWL_DURATION_MS = Number(process.env.MAX_CRAWL_DURATION_MS ?? 180_000);
-const MAX_CRAWL_JOBS = Number(process.env.MAX_CRAWL_JOBS ?? 3);
-const MAX_CRAWL_JOB_HISTORY = Number(process.env.MAX_CRAWL_JOB_HISTORY ?? 5);
+const MAX_CRAWL_PAGES = Number(process.env.MAX_CRAWL_PAGES ?? 25);
+const CRAWL_PAGE_TEXT_CHARS = Number(process.env.CRAWL_PAGE_TEXT_CHARS ?? 12_000);
+const MAX_CRAWL_TOTAL_CHARS = Number(process.env.MAX_CRAWL_TOTAL_CHARS ?? 180_000);
+const MAX_CRAWL_DURATION_MS = Number(process.env.MAX_CRAWL_DURATION_MS ?? 150_000);
+const MAX_CRAWL_JOBS = Number(process.env.MAX_CRAWL_JOBS ?? 1);
+const MAX_CRAWL_JOB_HISTORY = Number(process.env.MAX_CRAWL_JOB_HISTORY ?? 3);
+const MAX_REQUESTS_PER_PAGE = Math.max(30, Math.min(250, Number(process.env.MAX_REQUESTS_PER_PAGE ?? 120)));
 
 const app = Fastify({
   logger: true,
@@ -150,6 +151,7 @@ async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks
   let navigationStatus: number | null = null;
   let navigationError: string | null = null;
   const blocked: Record<string, number> = {};
+  let requestCount = 0;
 
   try {
     context = await b.newContext({
@@ -166,6 +168,12 @@ async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks
     // Validate every requested URL, including redirects and subresources, to reduce SSRF risk.
     await page.route("**/*", async (route: Route) => {
       const request = route.request();
+      requestCount += 1;
+      if (requestCount > MAX_REQUESTS_PER_PAGE) {
+        blocked["request_limit"] = (blocked["request_limit"] ?? 0) + 1;
+        await route.abort("blockedbyclient").catch(() => {});
+        return;
+      }
       const requestUrl = request.url();
       try {
         await assertPublicHttpUrl(requestUrl);
@@ -261,7 +269,7 @@ async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks
 
       // Remove non-content regions from a clone, leaving the live page untouched.
       const clone = document.body?.cloneNode(true) as HTMLElement | undefined;
-      clone?.querySelectorAll("script,style,noscript,svg,canvas,iframe,nav,footer,header,[role=navigation],[aria-hidden=true]")
+      clone?.querySelectorAll("script,style,noscript,svg,canvas,iframe,nav,footer,header,aside,pre,code,button,input,select,textarea,[role=navigation],[aria-hidden=true],[role=menu],[role=dialog]")
         .forEach(el => el.remove());
       const bodyText = (clone?.innerText || document.body?.innerText || "")
         .replace(/\u00a0/g, " ")
@@ -387,21 +395,36 @@ function isSameSite(raw: string, root: URL): boolean {
 
 function classifyPage(rawUrl: string, title = "", description = "", headings: Array<{text: string}> = []): string {
   const u = new URL(rawUrl);
-  const path = `${u.pathname} ${title} ${description} ${headings.map(h => h.text).join(" ")}`.toLowerCase();
-  if (u.pathname === "/" || u.pathname === "") return "home";
-  if (/\b(pricing|plans|billing|cost|price|packages)\b/.test(path)) return "pricing";
-  if (/\b(use cases?|industries|solutions|for teams|for developers|for agencies)\b/.test(path)) return "use_cases";
-  if (/\b(integrations?|connectors?|marketplace|apps directory)\b/.test(path)) return "integrations";
-  if (/\b(features?|capabilities|what you can do)\b/.test(path)) return "features";
-  if (/\b(product|platform|how it works|workflow)\b/.test(path)) return "product";
-  if (/\b(faq|frequently asked questions|questions and answers)\b/.test(path)) return "faq";
-  if (/\b(security|privacy|compliance|trust center|gdpr|soc 2)\b/.test(path)) return "security";
-  if (/\b(customers?|case studies|customer stories|testimonials|success stories)\b/.test(path)) return "customers";
-  if (/\b(documentation|docs|api reference|developer guide|getting started)\b/.test(path) || /^\/(docs|documentation|api)(\/|$)/.test(u.pathname)) return "docs";
-  if (/\b(blog|articles?|news|resources|guides?)\b/.test(path)) return "blog_resources";
-  if (/\b(about|our story|company|team|mission)\b/.test(path)) return "about";
-  if (/\b(contact|support|sales|book a demo|request a demo)\b/.test(path)) return "contact";
-  if (/\b(terms|legal|cookies|acceptable use)\b/.test(path)) return "legal";
+  const path = u.pathname.replace(/%20/gi, " ").toLowerCase().replace(/[-_]+/g, " ");
+  const meta = `${title} ${description} ${headings.slice(0, 12).map(h => h.text).join(" ")}`.toLowerCase();
+
+  // Prefer URL structure over broad body/heading keywords; this avoids classifying
+  // API reference pages as contact pages just because they mention "contact".
+  if (path === "/" || path === "") return "home";
+  if (/^\/(docs?|documentation|reference|api|learn)(\/|$)/.test(path) || /\b(api reference|documentation|developer guide|getting started)\b/.test(`${path} ${title.toLowerCase()}`)) return "docs";
+  if (/^\/(blog|news|articles?|resources)(\/|$)/.test(path)) return "blog_resources";
+  if (/^\/(pricing|plans|billing)(\/|$)/.test(path)) return "pricing";
+  if (/^\/(features?|capabilities)(\/|$)/.test(path)) return "features";
+  if (/^\/(integrations?|connectors?|marketplace)(\/|$)/.test(path)) return "integrations";
+  if (/^\/(solutions?|use cases?|industries)(\/|$)/.test(path)) return "use_cases";
+  if (/^\/(customers?|case studies?|testimonials?)(\/|$)/.test(path)) return "customers";
+  if (/^\/(security|privacy|trust|compliance)(\/|$)/.test(path)) return "security";
+  if (/^\/(about|company|our story|team)(\/|$)/.test(path)) return "about";
+  if (/^\/(contact|support|sales|demo)(\/|$)/.test(path)) return "contact";
+  if (/^\/(terms|legal|cookies|acceptable use)(\/|$)/.test(path)) return "legal";
+
+  if (/\b(pricing|plans|billing|cost|price|packages)\b/.test(meta)) return "pricing";
+  if (/\b(use cases?|industries|solutions|for teams|for developers|for agencies)\b/.test(meta)) return "use_cases";
+  if (/\b(integrations?|connectors?|marketplace|apps directory)\b/.test(meta)) return "integrations";
+  if (/\b(faq|frequently asked questions|questions and answers)\b/.test(meta)) return "faq";
+  if (/\b(security|privacy|compliance|trust center|gdpr|soc 2)\b/.test(meta)) return "security";
+  if (/\b(customers?|case studies|customer stories|testimonials|success stories)\b/.test(meta)) return "customers";
+  if (/\b(blog|articles?|news|resources|guides?)\b/.test(`${path} ${title.toLowerCase()}`)) return "blog_resources";
+  if (/\b(features?|capabilities|what you can do)\b/.test(meta)) return "features";
+  if (/\b(product|platform|how it works|workflow)\b/.test(meta)) return "product";
+  if (/\b(about|our story|company|team|mission)\b/.test(meta)) return "about";
+  if (/\b(contact|support|sales|book a demo|request a demo)\b/.test(meta)) return "contact";
+  if (/\b(terms|legal|cookies|acceptable use)\b/.test(meta)) return "legal";
   return "other";
 }
 
@@ -479,7 +502,7 @@ function parseXmlLocs(xml: string): string[] {
     .filter(Boolean);
 }
 
-async function discoverSitemapPages(root: URL, maxUrls = 1500): Promise<{urls: string[]; sitemap_count: number; robots_found: boolean}> {
+async function discoverSitemapPages(root: URL, maxUrls = 500): Promise<{urls: string[]; sitemap_count: number; robots_found: boolean}> {
   const sitemapQueue: string[] = [];
   let robotsFound = false;
   const robots = await fetchTextLimited(new URL("/robots.txt", root).toString(), 256_000);
@@ -495,15 +518,15 @@ async function discoverSitemapPages(root: URL, maxUrls = 1500): Promise<{urls: s
   }
   const seenSitemaps = new Set<string>();
   const pages = new Set<string>();
-  while (sitemapQueue.length && seenSitemaps.size < 5 && pages.size < maxUrls) {
+  while (sitemapQueue.length && seenSitemaps.size < 10 && pages.size < maxUrls) {
     const candidate = sitemapQueue.shift()!;
     const normalized = normalizeCrawlUrl(candidate);
     if (!normalized || seenSitemaps.has(normalized) || !isSameSite(normalized, root)) continue;
     seenSitemaps.add(normalized);
     const fetched = await fetchTextLimited(normalized, 1_000_000);
-    if (!fetched || !/<(?:urlset|sitemapindex)\b/i.test(fetched.text.slice(0, 1000))) continue;
+    if (!fetched || !/<(?:[\w.-]+:)?(?:urlset|sitemapindex)\b/i.test(fetched.text.slice(0, 4000))) continue;
     const locs = parseXmlLocs(fetched.text);
-    if (/<sitemapindex\b/i.test(fetched.text.slice(0, 2000))) {
+    if (/<(?:[\w.-]+:)?sitemapindex\b/i.test(fetched.text.slice(0, 4000))) {
       for (const loc of locs) if (sitemapQueue.length < 20) sitemapQueue.push(loc);
     } else {
       for (const loc of locs) {
@@ -551,18 +574,39 @@ function buildWebsiteFacts(pages: Array<Record<string, any>>) {
   const facts: Record<string, Array<{text: string; source_url: string; source_title: string; page_type: string}>> = {};
   for (const key of Object.keys(categories)) facts[key] = [];
   const seen = new Set<string>();
+  const boilerplate = /^(home|menu|close|open menu|skip to content|search|sign in|log in|sign up|next|previous|copy|edit this page|on this page|table of contents|github|twitter|linkedin|discord|youtube|copyright|all rights reserved)$/i;
+  const priority: Record<string, number> = { home: 8, product: 7, features: 7, pricing: 7, use_cases: 6, integrations: 6, customers: 5, security: 4, faq: 4, about: 3, contact: 2, docs: 1, blog_resources: 1, other: 0 };
+
   for (const page of pages) {
-    const chunks = String(page.body_text || "").split(/\n+|(?<=[.!?])\s+/).map((x: string) => x.replace(/\s+/g, " ").trim());
-    const candidates = [...(page.headings || []).map((h: any) => h.text), ...chunks];
+    const pageType = String(page.page_type || "other");
+    const title = String(page.title || "");
+    const rawChunks = String(page.body_text || "").split(/\n+|(?<=[.!?])\s+/);
+    const chunks = rawChunks.map((x: string) => x.replace(/\s+/g, " ").trim());
+    const headingChunks = (page.headings || []).map((h: any) => String(h.text || "").replace(/\s+/g, " ").trim());
+    const candidates = [...headingChunks, ...chunks];
     for (const raw of candidates) {
-      const snippet = String(raw || "").trim();
-      if (snippet.length < 24 || snippet.length > 320) continue;
+      const snippet = String(raw || "").replace(/\s+/g, " ").trim();
+      if (snippet.length < 28 || snippet.length > 280 || boilerplate.test(snippet)) continue;
+      // Discard code-like fragments and text with too little natural-language signal.
+      const letters = (snippet.match(/[a-zA-Z]/g) || []).length;
+      const symbols = (snippet.match(/[{}<>;=]/g) || []).length;
+      if (letters < 18 || symbols > Math.max(5, letters * 0.12) || /^(const|function|import|export|return|class|interface|type)\b/i.test(snippet)) continue;
       for (const [category, pattern] of Object.entries(categories)) {
-        if (facts[category].length >= 18 || !pattern.test(snippet)) continue;
-        const key = `${category}:${snippet.toLowerCase()}`;
-        if (seen.has(key)) continue;
+        if (facts[category].length >= 12 || !pattern.test(snippet)) continue;
+        // Avoid using generic docs/blog pages as first-choice marketing evidence when
+        // the same category can be sourced from a more relevant product page.
+        const normalized = snippet.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+        const key = `${category}:${normalized}`;
+        const existingIndex = facts[category].findIndex(item => item.text.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim() === normalized);
+        if (existingIndex >= 0) {
+          const existing = facts[category][existingIndex];
+          const existingPriority = priority[existing.page_type] ?? 0;
+          if ((priority[pageType] ?? 0) <= existingPriority) continue;
+          facts[category].splice(existingIndex, 1);
+        }
+        if (seen.has(key)) seen.delete(key);
         seen.add(key);
-        facts[category].push({ text: snippet, source_url: page.url, source_title: page.title || "", page_type: page.page_type || "other" });
+        facts[category].push({ text: snippet, source_url: page.url, source_title: title, page_type: pageType });
       }
     }
   }
@@ -810,7 +854,7 @@ app.post<{ Body: { url?: string; maxPages?: number; maxDepth?: number; maxDurati
     status_url: `/crawl/${id}`,
     poll_interval_ms: 3000,
     limits: job.request,
-    note: "Crawling runs asynchronously. Poll status_url until status is completed or failed. Results are held in memory; download/save the completed JSON promptly."
+    note: "Crawling runs asynchronously with bounded page, text, duration, and per-page request limits. Poll status_url until status is completed or failed. Results are held in memory; download/save the completed JSON promptly."
   });
 });
 
