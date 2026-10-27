@@ -3,6 +3,7 @@ import { chromium, type Browser, type BrowserContext, type Page, type Route } fr
 import PQueue from "p-queue";
 import dns from "node:dns/promises";
 import net from "node:net";
+import { randomUUID } from "node:crypto";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? "127.0.0.1";
@@ -11,7 +12,12 @@ const NAV_TIMEOUT_MS = Number(process.env.NAV_TIMEOUT_MS ?? 20_000);
 const READY_TIMEOUT_MS = Number(process.env.READY_TIMEOUT_MS ?? 8_000);
 const MAX_TEXT_CHARS = Number(process.env.MAX_TEXT_CHARS ?? 80_000);
 const MAX_LINKS = Number(process.env.MAX_LINKS ?? 500);
-const MAX_RESPONSE_BYTES = Number(process.env.MAX_RESPONSE_BYTES ?? 8 * 1024 * 1024);
+const MAX_CRAWL_PAGES = Number(process.env.MAX_CRAWL_PAGES ?? 50);
+const CRAWL_PAGE_TEXT_CHARS = Number(process.env.CRAWL_PAGE_TEXT_CHARS ?? 25_000);
+const MAX_CRAWL_TOTAL_CHARS = Number(process.env.MAX_CRAWL_TOTAL_CHARS ?? 300_000);
+const MAX_CRAWL_DURATION_MS = Number(process.env.MAX_CRAWL_DURATION_MS ?? 180_000);
+const MAX_CRAWL_JOBS = Number(process.env.MAX_CRAWL_JOBS ?? 3);
+const MAX_CRAWL_JOB_HISTORY = Number(process.env.MAX_CRAWL_JOB_HISTORY ?? 5);
 
 const app = Fastify({
   logger: true,
@@ -24,6 +30,17 @@ const queue = new PQueue({ concurrency: 1 });
 let browser: Browser | undefined;
 let completedJobs = 0;
 let browserStartedAt: string | null = null;
+
+type CrawlJob = {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  created_at: string;
+  updated_at: string;
+  request: { url: string; max_pages: number; max_depth: number; max_duration_ms: number; max_total_chars: number };
+  result?: Record<string, unknown>;
+  error?: string;
+};
+const crawlJobs = new Map<string, CrawlJob>();
 
 function ipv4ToInt(ip: string): number {
   return ip.split(".").reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0);
@@ -124,7 +141,7 @@ function trimText(value: string, max = MAX_TEXT_CHARS): string {
   return normalized.length > max ? normalized.slice(0, max) : normalized;
 }
 
-async function scrapeOne(rawUrl: string) {
+async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks = MAX_LINKS) {
   const initialUrl = await assertPublicHttpUrl(rawUrl);
   const b = await getBrowser();
   let context: BrowserContext | undefined;
@@ -197,6 +214,7 @@ async function scrapeOne(rawUrl: string) {
     // Wait for rendered body text, not networkidle (SPAs often keep connections open).
     await page.waitForFunction(
       () => (document.body?.innerText?.trim().length ?? 0) > 80,
+      undefined,
       { timeout: READY_TIMEOUT_MS }
     ).catch(() => {});
 
@@ -273,7 +291,7 @@ async function scrapeOne(rawUrl: string) {
         og_image: property("og:image"),
         robots: meta("robots")
       };
-    }, { maxText: MAX_TEXT_CHARS, maxLinks: MAX_LINKS });
+    }, { maxText: maxTextChars, maxLinks });
 
     const finalUrl = page.url();
     // Validate the final URL too; don't return content after a redirect to a private host.
@@ -333,6 +351,404 @@ async function scrapeOne(rawUrl: string) {
   }
 }
 
+type CrawlCandidate = {
+  url: string;
+  depth: number;
+  score: number;
+  discovered_from: string;
+  anchor_text?: string;
+};
+
+function normalizedHost(hostname: string): string {
+  return hostname.toLowerCase().replace(/^www\./, "");
+}
+
+function normalizeCrawlUrl(raw: string): string | null {
+  try {
+    const u = new URL(raw);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    u.hash = "";
+    // Query strings frequently create endless filter/tracking variants. Crawl the canonical path.
+    u.search = "";
+    if (u.pathname.length > 1) u.pathname = u.pathname.replace(/\/+$/, "");
+    return u.toString();
+  } catch {
+    return null;
+  }
+}
+
+function isSameSite(raw: string, root: URL): boolean {
+  try {
+    const u = new URL(raw);
+    return normalizedHost(u.hostname) === normalizedHost(root.hostname) &&
+      (u.protocol === "http:" || u.protocol === "https:");
+  } catch { return false; }
+}
+
+function classifyPage(rawUrl: string, title = "", description = "", headings: Array<{text: string}> = []): string {
+  const u = new URL(rawUrl);
+  const path = `${u.pathname} ${title} ${description} ${headings.map(h => h.text).join(" ")}`.toLowerCase();
+  if (u.pathname === "/" || u.pathname === "") return "home";
+  if (/\b(pricing|plans|billing|cost|price|packages)\b/.test(path)) return "pricing";
+  if (/\b(use cases?|industries|solutions|for teams|for developers|for agencies)\b/.test(path)) return "use_cases";
+  if (/\b(integrations?|connectors?|marketplace|apps directory)\b/.test(path)) return "integrations";
+  if (/\b(features?|capabilities|what you can do)\b/.test(path)) return "features";
+  if (/\b(product|platform|how it works|workflow)\b/.test(path)) return "product";
+  if (/\b(faq|frequently asked questions|questions and answers)\b/.test(path)) return "faq";
+  if (/\b(security|privacy|compliance|trust center|gdpr|soc 2)\b/.test(path)) return "security";
+  if (/\b(customers?|case studies|customer stories|testimonials|success stories)\b/.test(path)) return "customers";
+  if (/\b(documentation|docs|api reference|developer guide|getting started)\b/.test(path) || /^\/(docs|documentation|api)(\/|$)/.test(u.pathname)) return "docs";
+  if (/\b(blog|articles?|news|resources|guides?)\b/.test(path)) return "blog_resources";
+  if (/\b(about|our story|company|team|mission)\b/.test(path)) return "about";
+  if (/\b(contact|support|sales|book a demo|request a demo)\b/.test(path)) return "contact";
+  if (/\b(terms|legal|cookies|acceptable use)\b/.test(path)) return "legal";
+  return "other";
+}
+
+function scoreCandidate(rawUrl: string, anchor = "", source = "internal_link"): number {
+  let u: URL;
+  try { u = new URL(rawUrl); } catch { return -1000; }
+  const path = `${u.pathname} ${anchor}`.toLowerCase();
+  if (/\.(?:png|jpe?g|gif|webp|svg|ico|pdf|zip|gz|css|js|map|woff2?|ttf|mp4|mp3|xml)$/i.test(u.pathname)) return -1000;
+  if (/\/(?:logout|log-out|signout|sign-out|unsubscribe|cart|checkout|account|login|signin|sign-in|register|search)(?:\/|$)/i.test(u.pathname)) return -500;
+  if (/(?:^|[?&])(utm_|gclid|fbclid|sort=|filter=|page=)/i.test(u.search)) return -200;
+  if (source === "start_url") return 1000;
+  let score = source === "sitemap" ? 25 : 0;
+  const rules: Array<[RegExp, number]> = [
+    [/pricing|plans|billing|price|packages/, 100],
+    [/features?|capabilities/, 85],
+    [/product|platform|how-it-works/, 75],
+    [/solutions?|use-cases?|industries/, 72],
+    [/integrations?|connectors?|marketplace/, 65],
+    [/customers?|case-stud|testimonials?|success-stor/, 62],
+    [/faq|frequently-asked/, 55],
+    [/security|trust|compliance|privacy/, 48],
+    [/about|our-story|company|team/, 42],
+    [/contact|demo|sales/, 40],
+    [/docs|documentation|api|guides?/, 32],
+    [/blog|resources|articles?|news/, 20],
+    [/terms|legal|cookies/, 4]
+  ];
+  for (const [re, weight] of rules) if (re.test(path)) score += weight;
+  if (u.pathname.split("/").filter(Boolean).length <= 1) score += 8;
+  if (anchor && /pricing|features|product|integrations|customers|solutions|use cases|about|contact|demo/i.test(anchor)) score += 15;
+  if (source === "sitemap") score += 5;
+  return score;
+}
+
+async function fetchTextLimited(rawUrl: string, maxBytes = 1_000_000): Promise<{url: string; status: number; text: string} | null> {
+  let current = await assertPublicHttpUrl(rawUrl);
+  for (let redirects = 0; redirects <= 4; redirects++) {
+    const response = await fetch(current, {
+      redirect: "manual",
+      signal: AbortSignal.timeout(5_000),
+      headers: { "user-agent": "LightweightSiteCrawler/1.0 (+public-page-indexing)" }
+    }).catch(() => null);
+    if (!response) return null;
+    if ([301, 302, 303, 307, 308].includes(response.status)) {
+      const location = response.headers.get("location");
+      if (!location || redirects === 4) return null;
+      current = await assertPublicHttpUrl(new URL(location, current).toString());
+      continue;
+    }
+    if (!response.ok) return null;
+    const declared = Number(response.headers.get("content-length") || 0);
+    if (declared > maxBytes) return null;
+    if (!response.body) return { url: current.toString(), status: response.status, text: "" };
+    const reader = response.body.getReader();
+    const chunks: Uint8Array[] = [];
+    let total = 0;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      total += value.byteLength;
+      if (total > maxBytes) { await reader.cancel().catch(() => {}); return null; }
+      chunks.push(value);
+    }
+    const bytes = new Uint8Array(total);
+    let offset = 0;
+    for (const chunk of chunks) { bytes.set(chunk, offset); offset += chunk.byteLength; }
+    return { url: current.toString(), status: response.status, text: new TextDecoder().decode(bytes) };
+  }
+  return null;
+}
+
+function parseXmlLocs(xml: string): string[] {
+  return [...xml.matchAll(/<loc\b[^>]*>([\s\S]*?)<\/loc>/gi)]
+    .map(m => m[1].trim().replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">"))
+    .filter(Boolean);
+}
+
+async function discoverSitemapPages(root: URL, maxUrls = 1500): Promise<{urls: string[]; sitemap_count: number; robots_found: boolean}> {
+  const sitemapQueue: string[] = [];
+  let robotsFound = false;
+  const robots = await fetchTextLimited(new URL("/robots.txt", root).toString(), 256_000);
+  if (robots) {
+    robotsFound = true;
+    for (const line of robots.text.split(/\r?\n/)) {
+      const match = line.match(/^\s*sitemap\s*:\s*(\S+)/i);
+      if (match) sitemapQueue.push(match[1]);
+    }
+  }
+  for (const path of ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml", "/wp-sitemap.xml"]) {
+    sitemapQueue.push(new URL(path, root).toString());
+  }
+  const seenSitemaps = new Set<string>();
+  const pages = new Set<string>();
+  while (sitemapQueue.length && seenSitemaps.size < 5 && pages.size < maxUrls) {
+    const candidate = sitemapQueue.shift()!;
+    const normalized = normalizeCrawlUrl(candidate);
+    if (!normalized || seenSitemaps.has(normalized) || !isSameSite(normalized, root)) continue;
+    seenSitemaps.add(normalized);
+    const fetched = await fetchTextLimited(normalized, 1_000_000);
+    if (!fetched || !/<(?:urlset|sitemapindex)\b/i.test(fetched.text.slice(0, 1000))) continue;
+    const locs = parseXmlLocs(fetched.text);
+    if (/<sitemapindex\b/i.test(fetched.text.slice(0, 2000))) {
+      for (const loc of locs) if (sitemapQueue.length < 20) sitemapQueue.push(loc);
+    } else {
+      for (const loc of locs) {
+        const pageUrl = normalizeCrawlUrl(loc);
+        if (pageUrl && isSameSite(pageUrl, root)) pages.add(pageUrl);
+        if (pages.size >= maxUrls) break;
+      }
+    }
+  }
+  return { urls: [...pages], sitemap_count: seenSitemaps.size, robots_found: robotsFound };
+}
+
+function flattenJsonLd(value: unknown, output: Record<string, any>[], depth = 0): void {
+  if (depth > 6 || output.length > 500 || !value) return;
+  if (Array.isArray(value)) { for (const item of value) flattenJsonLd(item, output, depth + 1); return; }
+  if (typeof value !== "object") return;
+  const obj = value as Record<string, any>;
+  output.push(obj);
+  if (obj["@graph"]) flattenJsonLd(obj["@graph"], output, depth + 1);
+  if (obj["mainEntity"]) flattenJsonLd(obj["mainEntity"], output, depth + 1);
+  if (obj["@type"] === "FAQPage" && obj["mainEntity"]) flattenJsonLd(obj["mainEntity"], output, depth + 1);
+}
+
+function textValue(value: unknown): string | null {
+  if (typeof value === "string") return value.slice(0, 1000);
+  if (typeof value === "number") return String(value);
+  return null;
+}
+
+function buildWebsiteFacts(pages: Array<Record<string, any>>) {
+  const categories: Record<string, RegExp> = {
+    value_proposition: /\b(helps?|enables?|allows?|designed to|built to|makes it easier|all-in-one|platform for|solution for)\b/i,
+    features: /\b(features?|automate|analytics|dashboard|workflow|templates?|generate|schedule|integrat|manage|track|monitor|publish|collaborat)\b/i,
+    pricing: /\b(pricing|free plan|free trial|per month|per year|\/month|\/year|\$\s?\d|₹\s?\d|pricing plans?|enterprise plan)\b/i,
+    use_cases: /\b(use case|for teams|for agencies|for developers|for creators|for businesses|designed for|ideal for|work with)\b/i,
+    integrations: /\b(integrat|connects? with|works with|sync with|api access|webhooks?)\b/i,
+    target_audience: /\b(marketers?|developers?|founders?|creators?|agencies|small businesses|enterprise teams|startups?|e-commerce|ecommerce)\b/i,
+    faq: /\b(how do i|how does|what is|can i |do you |is there|frequently asked|common questions)\b/i,
+    trust_and_security: /\b(security|privacy|compliance|encryption|gdpr|soc 2|data protection|permissions|secure)\b/i,
+    social_proof: /\b(customers?|trusted by|testimonials?|case stud|reviews?|ratings?|teams use|companies use|success stories)\b/i,
+    calls_to_action: /\b(get started|start free|try for free|book a demo|request a demo|sign up|create account|join now|contact sales)\b/i,
+    company_about: /\b(our mission|our story|about us|founded|our team|who we are|company)\b/i,
+    content_topics: /\b(blog|guide|tutorial|learn|best practices|resources|latest|announcements|case study)\b/i
+  };
+  const facts: Record<string, Array<{text: string; source_url: string; source_title: string; page_type: string}>> = {};
+  for (const key of Object.keys(categories)) facts[key] = [];
+  const seen = new Set<string>();
+  for (const page of pages) {
+    const chunks = String(page.body_text || "").split(/\n+|(?<=[.!?])\s+/).map((x: string) => x.replace(/\s+/g, " ").trim());
+    const candidates = [...(page.headings || []).map((h: any) => h.text), ...chunks];
+    for (const raw of candidates) {
+      const snippet = String(raw || "").trim();
+      if (snippet.length < 24 || snippet.length > 320) continue;
+      for (const [category, pattern] of Object.entries(categories)) {
+        if (facts[category].length >= 18 || !pattern.test(snippet)) continue;
+        const key = `${category}:${snippet.toLowerCase()}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        facts[category].push({ text: snippet, source_url: page.url, source_title: page.title || "", page_type: page.page_type || "other" });
+      }
+    }
+  }
+  return facts;
+}
+
+function summarizeStructuredData(pages: Array<Record<string, any>>) {
+  const typeCounts: Record<string, number> = {};
+  const entities: Array<Record<string, unknown>> = [];
+  const questions: Array<Record<string, unknown>> = [];
+  const seen = new Set<string>();
+  for (const page of pages) {
+    const flattened: Record<string, any>[] = [];
+    flattenJsonLd(page.structured_data, flattened);
+    for (const item of flattened) {
+      const rawTypes = Array.isArray(item["@type"]) ? item["@type"] : [item["@type"]];
+      const types = rawTypes.filter((x: unknown) => typeof x === "string") as string[];
+      for (const type of types) typeCounts[type] = (typeCounts[type] || 0) + 1;
+      const name = textValue(item.name || item.headline || item.legalName);
+      const description = textValue(item.description);
+      const url = textValue(item.url || item["@id"]);
+      const offers = item.offers && typeof item.offers === "object" ? item.offers : null;
+      if (types.some(t => /Organization|LocalBusiness|Product|Service|SoftwareApplication|WebSite|WebPage|Offer|Event|Article|Course|Person|Brand|AggregateRating|BreadcrumbList/i.test(t))) {
+        const entity = {
+          types, name, description, url,
+          price: offers ? textValue(offers.price ?? offers.lowPrice) : textValue(item.price),
+          price_currency: offers ? textValue(offers.priceCurrency) : textValue(item.priceCurrency),
+          rating: item.aggregateRating ? { value: textValue(item.aggregateRating.ratingValue), count: textValue(item.aggregateRating.reviewCount ?? item.aggregateRating.ratingCount) } : null,
+          source_url: page.url
+        };
+        const key = JSON.stringify([types, name, url, page.url]);
+        if (!seen.has(key) && entities.length < 150) { seen.add(key); entities.push(entity); }
+      }
+      if (types.includes("Question") || item.acceptedAnswer) {
+        const q = { question: name || textValue(item.text), answer: textValue(item.acceptedAnswer?.text || item.acceptedAnswer?.name), source_url: page.url };
+        if ((q.question || q.answer) && questions.length < 100) questions.push(q);
+      }
+    }
+  }
+  return { type_counts: typeCounts, entities, faq_questions: questions };
+}
+
+async function crawlWebsite(rawUrl: string, options: {maxPages: number; maxDepth: number; maxDurationMs: number; maxTotalChars: number}) {
+  const root = await assertPublicHttpUrl(rawUrl);
+  const started = Date.now();
+  const limits = { max_pages: options.maxPages, max_depth: options.maxDepth, max_duration_ms: options.maxDurationMs, max_total_chars: options.maxTotalChars };
+  const sitemap = await discoverSitemapPages(root).catch(() => ({ urls: [] as string[], sitemap_count: 0, robots_found: false }));
+  const candidates = new Map<string, CrawlCandidate>();
+  const visited = new Set<string>();
+  const pages: Array<Record<string, any>> = [];
+  const failures: Array<{url: string; error: string}> = [];
+  let totalChars = 0;
+  let truncated = false;
+
+  const enqueue = (raw: string, depth: number, source: string, anchor = "") => {
+    const normalized = normalizeCrawlUrl(raw);
+    if (!normalized || !isSameSite(normalized, root) || visited.has(normalized)) return;
+    if (depth > options.maxDepth) return;
+    const score = scoreCandidate(normalized, anchor, source);
+    if (score < -100) return;
+    const old = candidates.get(normalized);
+    if (!old || score > old.score || depth < old.depth) {
+      candidates.set(normalized, { url: normalized, depth, score, discovered_from: source, anchor_text: anchor.slice(0, 160) });
+    }
+  };
+
+  enqueue(root.toString(), 0, "start_url");
+  for (const url of sitemap.urls) enqueue(url, 1, "sitemap");
+  const rootNormalized = normalizeCrawlUrl(root.toString())!;
+
+  while (pages.length + failures.length < options.maxPages && candidates.size > 0) {
+    if (Date.now() - started > options.maxDurationMs || totalChars >= options.maxTotalChars) {
+      truncated = true;
+      break;
+    }
+    const next = [...candidates.values()].sort((a, b) => b.score - a.score || a.depth - b.depth)[0];
+    candidates.delete(next.url);
+    if (visited.has(next.url)) continue;
+    visited.add(next.url);
+    try {
+      const result = await scrapeOne(next.url, Math.min(CRAWL_PAGE_TEXT_CHARS, options.maxTotalChars - totalChars), 150);
+      const finalUrl = normalizeCrawlUrl(String(result.url || next.url));
+      if (!finalUrl || !isSameSite(finalUrl, root)) {
+        failures.push({ url: next.url, error: "Redirected outside the allowed site; page was excluded." });
+        continue;
+      }
+      const pageText = String(result.body_text || "").slice(0, Math.max(0, options.maxTotalChars - totalChars));
+      totalChars += pageText.length;
+      const pageType = classifyPage(finalUrl, String(result.title || ""), String(result.description || ""), (result.headings as Array<{text: string}>) || []);
+      const page: Record<string, any> = {
+        url: finalUrl,
+        requested_url: next.url,
+        status: result.status,
+        title: result.title,
+        description: result.description,
+        canonical_url: result.canonical_url,
+        language: result.language,
+        page_type: pageType,
+        priority_score: next.score,
+        depth: next.depth,
+        discovered_from: next.discovered_from,
+        headings: (result.headings as unknown[] || []).slice(0, 100),
+        body_text: pageText,
+        links: (result.links as unknown[] || []).slice(0, 100),
+        buttons: (result.buttons as unknown[] || []).slice(0, 30),
+        images: (result.images as unknown[] || []).slice(0, 30),
+        structured_data: result.structured_data || [],
+        social_metadata: result.social_metadata || {},
+        extraction: result.extraction || {}
+      };
+      page.content_markdown = `# ${page.title || finalUrl}\n\n${page.description ? `> ${page.description}\n\n` : ""}## Content\n${pageText}`;
+      pages.push(page);
+      for (const link of (result.links as Array<{url?: string; text?: string}> || [])) {
+        if (link.url) enqueue(link.url, next.depth + 1, "internal_link", link.text || "");
+      }
+      // Don't let a redirect/canonical duplicate consume additional page slots.
+      visited.add(finalUrl);
+      if (totalChars >= options.maxTotalChars) { truncated = candidates.size > 0; break; }
+    } catch (err) {
+      failures.push({ url: next.url, error: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500) });
+    }
+  }
+  if (candidates.size > 0 && pages.length + failures.length >= options.maxPages) truncated = true;
+
+  const homepage = pages.find(p => normalizeCrawlUrl(p.url) === rootNormalized) || pages[0];
+  const inventory = pages.map(p => ({ url: p.url, title: p.title, description: p.description, page_type: p.page_type, priority_score: p.priority_score, depth: p.depth, headings: (p.headings || []).slice(0, 25) }));
+  const byType: Record<string, Array<{url: string; title: string}>> = {};
+  for (const page of pages) {
+    byType[page.page_type] ||= [];
+    byType[page.page_type].push({ url: page.url, title: page.title || page.url });
+  }
+  const structured = summarizeStructuredData(pages);
+  const facts = buildWebsiteFacts(pages);
+  const keyTypes = ["pricing", "features", "product", "use_cases", "integrations", "customers", "about", "security", "faq", "contact", "docs", "blog_resources"];
+  const keyPages = keyTypes.flatMap(type => (byType[type] || []).slice(0, 8).map(p => ({ ...p, page_type: type })));
+  const siteNameEntity = structured.entities.find(e => (e.types as string[]).some(t => /Organization|LocalBusiness|Brand/i.test(t)) && e.name);
+  return {
+    schema_version: "1.0",
+    website: {
+      requested_url: root.toString(),
+      origin: root.origin,
+      name: siteNameEntity?.name || homepage?.title || root.hostname,
+      title: homepage?.title || null,
+      description: homepage?.description || null,
+      canonical_url: homepage?.canonical_url || null,
+      language: homepage?.language || null,
+      social_metadata: homepage?.social_metadata || {}
+    },
+    crawl: {
+      status: (truncated || failures.length > 0) ? "partial" : "completed",
+      started_at: new Date(started).toISOString(),
+      duration_ms: Date.now() - started,
+      limits,
+      pages_attempted: pages.length + failures.length,
+      pages_succeeded: pages.length,
+      pages_failed: failures.length,
+      total_text_characters: totalChars,
+      remaining_candidates: candidates.size,
+      truncated,
+      discovery: { robots_txt_found: sitemap.robots_found, sitemap_files_checked: sitemap.sitemap_count, sitemap_urls_found: sitemap.urls.length },
+      failures
+    },
+    site_profile: {
+      overview: homepage?.description || (homepage?.title ? `${homepage.title}${homepage.description ? ` — ${homepage.description}` : ""}` : null),
+      page_counts_by_type: Object.fromEntries(Object.entries(byType).map(([k, v]) => [k, v.length])),
+      key_pages: keyPages,
+      evidence: facts,
+      structured_data_summary: structured,
+      content_generation_notes: [
+        "Use evidence items with source_url as factual grounding; do not invent features, prices, integrations, customer claims, or guarantees.",
+        "Use pricing pages and structured Offer/Product data as the source of truth for pricing claims.",
+        "Use feature, use-case, integration and customer pages to vary post angles; avoid repeating the same page evidence across posts.",
+        "Page classification and evidence categories are heuristic labels, not verified business facts."
+      ]
+    },
+    page_inventory: inventory,
+    pages
+  };
+}
+
+function pruneCrawlJobs() {
+  const finished = [...crawlJobs.values()].filter(j => j.status === "completed" || j.status === "failed")
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  for (const job of finished.slice(MAX_CRAWL_JOB_HISTORY)) crawlJobs.delete(job.id);
+}
+
 app.get("/health", async () => ({
   ok: true,
   queue_size: queue.size,
@@ -341,6 +757,76 @@ app.get("/health", async () => ({
   browser_started_at: browserStartedAt,
   completed_jobs: completedJobs
 }));
+
+app.post<{ Body: { url?: string; maxPages?: number; maxDepth?: number; maxDurationMs?: number; maxTotalChars?: number } }>("/crawl", async (request, reply) => {
+  const body = request.body || {};
+  const url = body.url;
+  if (typeof url !== "string" || url.length > 2048) {
+    return reply.code(400).send({ error: "Provide a URL string up to 2048 characters." });
+  }
+  try { await assertPublicHttpUrl(url); }
+  catch (err) { return reply.code(400).send({ error: err instanceof Error ? err.message : "Invalid URL" }); }
+
+  const maxPages = Math.max(1, Math.min(MAX_CRAWL_PAGES, Number.isFinite(body.maxPages) ? Math.floor(body.maxPages!) : 20));
+  const maxDepth = Math.max(0, Math.min(5, Number.isFinite(body.maxDepth) ? Math.floor(body.maxDepth!) : 3));
+  const maxDurationMs = Math.max(10_000, Math.min(MAX_CRAWL_DURATION_MS, Number.isFinite(body.maxDurationMs) ? Math.floor(body.maxDurationMs!) : MAX_CRAWL_DURATION_MS));
+  const maxTotalChars = Math.max(10_000, Math.min(MAX_CRAWL_TOTAL_CHARS, Number.isFinite(body.maxTotalChars) ? Math.floor(body.maxTotalChars!) : MAX_CRAWL_TOTAL_CHARS));
+  const activeCrawls = [...crawlJobs.values()].filter(j => j.status === "queued" || j.status === "running").length;
+  if (activeCrawls >= MAX_CRAWL_JOBS || queue.size + queue.pending >= 10) {
+    return reply.code(429).send({ error: "Crawl capacity is full; retry after an existing crawl finishes." });
+  }
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const job: CrawlJob = {
+    id, status: "queued", created_at: now, updated_at: now,
+    request: { url, max_pages: maxPages, max_depth: maxDepth, max_duration_ms: maxDurationMs, max_total_chars: maxTotalChars }
+  };
+  crawlJobs.set(id, job);
+  pruneCrawlJobs();
+  void queue.add(async () => {
+    job.status = "running";
+    job.updated_at = new Date().toISOString();
+    try {
+      job.result = await crawlWebsite(url, { maxPages, maxDepth, maxDurationMs, maxTotalChars });
+      job.status = "completed";
+    } catch (err) {
+      job.error = err instanceof Error ? err.message : String(err);
+      job.status = "failed";
+    } finally {
+      job.updated_at = new Date().toISOString();
+      pruneCrawlJobs();
+    }
+  }).catch(err => {
+    job.status = "failed";
+    job.error = err instanceof Error ? err.message : String(err);
+    job.updated_at = new Date().toISOString();
+    pruneCrawlJobs();
+  });
+
+  return reply.code(202).send({
+    job_id: id,
+    status: job.status,
+    status_url: `/crawl/${id}`,
+    poll_interval_ms: 3000,
+    limits: job.request,
+    note: "Crawling runs asynchronously. Poll status_url until status is completed or failed. Results are held in memory; download/save the completed JSON promptly."
+  });
+});
+
+app.get<{ Params: { id: string } }>("/crawl/:id", async (request, reply) => {
+  const job = crawlJobs.get(request.params.id);
+  if (!job) return reply.code(404).send({ error: "Crawl job not found or expired. Jobs are stored in memory and may be lost after a service restart." });
+  return reply.send({
+    job_id: job.id,
+    status: job.status,
+    created_at: job.created_at,
+    updated_at: job.updated_at,
+    request: job.request,
+    ...(job.error ? { error: job.error } : {}),
+    ...(job.result ? { result: job.result } : {})
+  });
+});
 
 app.post<{ Body: { url?: string } }>("/scrape", async (request, reply) => {
   const url = request.body?.url;
