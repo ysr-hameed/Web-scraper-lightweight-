@@ -40,7 +40,21 @@ type CrawlJob = {
   request: { url: string; max_pages: number; max_depth: number; max_duration_ms: number; max_total_chars: number };
   result?: Record<string, unknown>;
   error?: string;
+  progress?: CrawlProgress;
 };
+
+export interface CrawlProgress {
+  /** Pages discovered so far (may grow as crawling continues). */
+  pages_found: number;
+  /** Pages fully read and extracted. */
+  pages_processed: number;
+  /** Page currently being read, if any. */
+  current_page: string | null;
+  /** Overall percent (0-100). */
+  percent: number;
+  /** Human-readable status message from the scraper. */
+  message: string | null;
+}
 const crawlJobs = new Map<string, CrawlJob>();
 
 function ipv4ToInt(ip: string): number {
@@ -649,7 +663,11 @@ function summarizeStructuredData(pages: Array<Record<string, any>>) {
   return { type_counts: typeCounts, entities, faq_questions: questions };
 }
 
-async function crawlWebsite(rawUrl: string, options: {maxPages: number; maxDepth: number; maxDurationMs: number; maxTotalChars: number}) {
+async function crawlWebsite(
+  rawUrl: string,
+  options: {maxPages: number; maxDepth: number; maxDurationMs: number; maxTotalChars: number},
+  onProgress?: (progress: CrawlProgress) => void
+) {
   const root = await assertPublicHttpUrl(rawUrl);
   const started = Date.now();
   const limits = { max_pages: options.maxPages, max_depth: options.maxDepth, max_duration_ms: options.maxDurationMs, max_total_chars: options.maxTotalChars };
@@ -673,9 +691,25 @@ async function crawlWebsite(rawUrl: string, options: {maxPages: number; maxDepth
     }
   };
 
+  const emitProgress = (currentPage: string | null, message: string | null) => {
+    const pagesFound = candidates.size + visited.size + failures.length;
+    const pagesProcessed = pages.length;
+    const percent = options.maxPages > 0 ? Math.min(100, Math.round((pagesProcessed / options.maxPages) * 100)) : 0;
+    const progress: CrawlProgress = {
+      pages_found: pagesFound,
+      pages_processed: pagesProcessed,
+      current_page: currentPage,
+      percent,
+      message: message ?? `Read ${pagesProcessed} of ${pagesFound} pages${currentPage ? ` (${currentPage})` : ""}`
+    };
+    if (onProgress) onProgress(progress);
+  };
+
   enqueue(root.toString(), 0, "start_url");
   for (const url of sitemap.urls) enqueue(url, 1, "sitemap");
   const rootNormalized = normalizeCrawlUrl(root.toString())!;
+
+  emitProgress(null, "Starting site read…");
 
   while (pages.length + failures.length < options.maxPages && candidates.size > 0) {
     if (Date.now() - started > options.maxDurationMs || totalChars >= options.maxTotalChars) {
@@ -687,6 +721,7 @@ async function crawlWebsite(rawUrl: string, options: {maxPages: number; maxDepth
     if (visited.has(next.url)) continue;
     visited.add(next.url);
     try {
+      emitProgress(next.url, `Reading ${next.url}`);
       const result = await scrapeOne(next.url, Math.min(CRAWL_PAGE_TEXT_CHARS, options.maxTotalChars - totalChars), 150);
       const finalUrl = normalizeCrawlUrl(String(result.url || next.url));
       if (!finalUrl || !isSameSite(finalUrl, root)) {
@@ -724,12 +759,16 @@ async function crawlWebsite(rawUrl: string, options: {maxPages: number; maxDepth
       }
       // Don't let a redirect/canonical duplicate consume additional page slots.
       visited.add(finalUrl);
+      emitProgress(null, `Read ${pages.length} page${pages.length !== 1 ? 's' : ''}`);
       if (totalChars >= options.maxTotalChars) { truncated = candidates.size > 0; break; }
     } catch (err) {
       failures.push({ url: next.url, error: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500) });
+      emitProgress(null, `Failed ${next.url}`);
     }
   }
   if (candidates.size > 0 && pages.length + failures.length >= options.maxPages) truncated = true;
+
+  emitProgress(null, truncated ? `Stopped at page limit (${pages.length} read)` : `Finished reading ${pages.length} page${pages.length !== 1 ? 's' : ''}`);
 
   const homepage = pages.find(p => normalizeCrawlUrl(p.url) === rootNormalized) || pages[0];
   const inventory = pages.map(p => ({ url: p.url, title: p.title, description: p.description, page_type: p.page_type, priority_score: p.priority_score, depth: p.depth, headings: (p.headings || []).slice(0, 25) }));
@@ -832,7 +871,10 @@ app.post<{ Body: { url?: string; maxPages?: number; maxDepth?: number; maxDurati
     job.status = "running";
     job.updated_at = new Date().toISOString();
     try {
-      job.result = await crawlWebsite(url, { maxPages, maxDepth, maxDurationMs, maxTotalChars });
+      job.result = await crawlWebsite(url, { maxPages, maxDepth, maxDurationMs, maxTotalChars }, (progress) => {
+        job.progress = progress;
+        job.updated_at = new Date().toISOString();
+      });
       job.status = "completed";
     } catch (err) {
       job.error = err instanceof Error ? err.message : String(err);
@@ -867,6 +909,7 @@ app.get<{ Params: { id: string } }>("/crawl/:id", async (request, reply) => {
     created_at: job.created_at,
     updated_at: job.updated_at,
     request: job.request,
+    ...(job.progress ? { progress: job.progress } : {}),
     ...(job.error ? { error: job.error } : {}),
     ...(job.result ? { result: job.result } : {})
   });
