@@ -18,7 +18,14 @@ const MAX_CRAWL_TOTAL_CHARS = Number(process.env.MAX_CRAWL_TOTAL_CHARS ?? 180_00
 const MAX_CRAWL_DURATION_MS = Number(process.env.MAX_CRAWL_DURATION_MS ?? 150_000);
 const MAX_CRAWL_JOBS = Number(process.env.MAX_CRAWL_JOBS ?? 1);
 const MAX_CRAWL_JOB_HISTORY = Number(process.env.MAX_CRAWL_JOB_HISTORY ?? 3);
+// Read several pages in parallel; the browser is shared but contexts are isolated.
+const CRAWL_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.CRAWL_CONCURRENCY ?? 3)));
+const CRAWL_SETTLE_MS = Math.max(50, Math.min(1_000, Number(process.env.CRAWL_SETTLE_MS ?? 120)));
 const MAX_REQUESTS_PER_PAGE = Math.max(30, Math.min(250, Number(process.env.MAX_REQUESTS_PER_PAGE ?? 120)));
+const MAX_BRAND_PAGES = Math.max(1, Math.min(5, Number(process.env.MAX_BRAND_PAGES ?? 3)));
+const MAX_BRAND_DURATION_MS = Math.max(8_000, Math.min(60_000, Number(process.env.MAX_BRAND_DURATION_MS ?? 25_000)));
+const MAX_BRAND_JOBS = Math.max(1, Math.min(5, Number(process.env.MAX_BRAND_JOBS ?? 2)));
+const MAX_BRAND_JOB_HISTORY = Math.max(1, Math.min(25, Number(process.env.MAX_BRAND_JOB_HISTORY ?? 6)));
 
 const app = Fastify({
   logger: true,
@@ -31,6 +38,7 @@ const queue = new PQueue({ concurrency: 1 });
 let browser: Browser | undefined;
 let completedJobs = 0;
 let browserStartedAt: string | null = null;
+let activePages = 0;
 
 type CrawlJob = {
   id: string;
@@ -56,6 +64,18 @@ export interface CrawlProgress {
   message: string | null;
 }
 const crawlJobs = new Map<string, CrawlJob>();
+
+type BrandJob = {
+  id: string;
+  status: "queued" | "running" | "completed" | "failed";
+  created_at: string;
+  updated_at: string;
+  request: { url: string; max_pages: number; max_duration_ms: number };
+  result?: Record<string, unknown>;
+  error?: string;
+  progress?: CrawlProgress;
+};
+const brandJobs = new Map<string, BrandJob>();
 
 function ipv4ToInt(ip: string): number {
   return ip.split(".").reduce((acc, part) => ((acc << 8) | Number(part)) >>> 0, 0);
@@ -156,9 +176,16 @@ function trimText(value: string, max = MAX_TEXT_CHARS): string {
   return normalized.length > max ? normalized.slice(0, max) : normalized;
 }
 
-async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks = MAX_LINKS) {
+async function scrapeOne(
+  rawUrl: string,
+  maxTextChars = MAX_TEXT_CHARS,
+  maxLinks = MAX_LINKS,
+  brandMode = false,
+  sharedBrowser?: Browser
+) {
   const initialUrl = await assertPublicHttpUrl(rawUrl);
-  const b = await getBrowser();
+  const b = sharedBrowser ?? (await getBrowser());
+  activePages += 1;
   let context: BrowserContext | undefined;
   let page: Page | undefined;
   const started = Date.now();
@@ -241,9 +268,9 @@ async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks
     ).catch(() => {});
 
     // Give hydration a short, bounded settling window without waiting for every request.
-    await page.waitForTimeout(350);
+    await page.waitForTimeout(CRAWL_SETTLE_MS);
 
-    const extracted = await page.evaluate(({ maxText, maxLinks }) => {
+    const extracted = await page.evaluate(({ maxText, maxLinks, brandMode }) => {
       const clean = (s: string | null | undefined) => (s ?? "").replace(/\s+/g, " ").trim();
       const meta = (name: string) =>
         document.querySelector<HTMLMetaElement>(`meta[name="${CSS.escape(name)}"]`)?.content ?? null;
@@ -298,6 +325,169 @@ async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks
         .filter(Boolean)
         .slice(0, 100);
 
+      let brandInfo: Record<string, any> | null = null;
+      if (brandMode) {
+        const attr = (selector: string, name: string) =>
+          (document.querySelector(selector) as Element | null)?.getAttribute(name) ?? null;
+        const metaAny = (key: string) =>
+          clean(document.querySelector<HTMLMetaElement>(`meta[name="${CSS.escape(key)}"]`)?.content ??
+            document.querySelector<HTMLMetaElement>(`meta[property="${CSS.escape(key)}"]`)?.content);
+        const toHex = (input: string | null | undefined): string | null => {
+          if (!input) return null;
+          const value = input.trim().toLowerCase();
+          const rgb = value.match(/rgba?\(([^)]+)\)/i);
+          if (rgb) {
+            const parts = rgb[1].split(",").map(part => part.trim());
+            const r = Number(parts[0]);
+            const g = Number(parts[1]);
+            const b = Number(parts[2]);
+            const a = parts[3] === undefined ? 1 : Number(parts[3]);
+            if (![r, g, b].every(Number.isFinite) || !Number.isFinite(a) || a === 0) return null;
+            if (r > 245 && g > 245 && b > 245) return null;
+            if (r < 8 && g < 8 && b < 8) return null;
+            return "#" + [r, g, b]
+              .map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, "0"))
+              .join("");
+          }
+          if (/^#[0-9a-f]{3,8}$/i.test(value)) return value.slice(0, 7);
+          return null;
+        };
+        const colorCounts = new Map<string, number>();
+        const addColor = (value: string | null | undefined) => {
+          const hex = toHex(value);
+          if (!hex) return;
+          colorCounts.set(hex, (colorCounts.get(hex) ?? 0) + 1);
+        };
+        addColor(metaAny("theme-color"));
+        const colorSources = [
+          document.body,
+          document.querySelector("header"),
+          document.querySelector("main"),
+          document.querySelector("nav"),
+          ...Array.from(document.querySelectorAll("button,a,[class*=btn],[class*=button],[class*=primary],[class*=accent]")).slice(0, 30)
+        ];
+        for (const el of colorSources) {
+          if (!el) continue;
+          const style = getComputedStyle(el as Element);
+          addColor(style.backgroundColor);
+          addColor(style.color);
+          addColor(style.borderTopColor);
+        }
+        const colors = [...colorCounts.entries()].sort((a, b) => b[1] - a[1]).map(([hex]) => hex).slice(0, 6);
+
+        const fontSet = new Set<string>();
+        const fontSources = [document.body, document.querySelector("h1"), document.querySelector("h2"), document.querySelector("button"), document.querySelector("nav a")];
+        for (const el of fontSources) {
+          if (!el) continue;
+          const family = getComputedStyle(el as Element).fontFamily.split(",")[0]?.replace(/["']/g, "").trim();
+          if (family && family.length < 60 && !/^(ui-|system-ui|sans-serif|serif|monospace|inherit|initial|unset)/i.test(family)) {
+            fontSet.add(family);
+          }
+        }
+        const fonts = [...fontSet].slice(0, 4);
+
+        const imageCandidates = Array.from(document.querySelectorAll<HTMLImageElement>("img"))
+          .map(img => ({
+            src: img.currentSrc || img.src,
+            alt: clean(img.alt),
+            inHeader: Boolean(img.closest("header,nav")),
+            className: typeof img.className === "string" ? img.className : ""
+          }))
+          .filter(img => img.src && /^https?:\/\//i.test(img.src));
+        const logo =
+          imageCandidates.find(img => /logo|brand/i.test(`${img.alt} ${img.src} ${img.className}`))?.src ??
+          imageCandidates.find(img => img.inHeader && !/avatar|icon|sprite/i.test(`${img.alt} ${img.src}`))?.src ??
+          attr('link[rel="apple-touch-icon"]', "href") ??
+          attr('link[rel="icon"]', "href") ??
+          null;
+
+        const socialDomains: Array<[string, RegExp]> = [
+          ["instagram", /instagram\.com/i],
+          ["linkedin", /linkedin\.com/i],
+          ["x", /(?:twitter|x)\.com/i],
+          ["facebook", /facebook\.com/i],
+          ["youtube", /youtube\.com|youtu\.be/i],
+          ["tiktok", /tiktok\.com/i],
+          ["github", /github\.com/i],
+          ["pinterest", /pinterest\.com/i]
+        ];
+        const allAnchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"))
+          .map(a => ({ url: a.href, text: clean(a.innerText || a.getAttribute("aria-label") || a.title) }))
+          .filter(a => a.url.startsWith("http") || a.url.startsWith("mailto:") || a.url.startsWith("tel:"));
+        const social: Record<string, string> = {};
+        for (const anchor of allAnchors) {
+          for (const [key, pattern] of socialDomains) {
+            if (!social[key] && pattern.test(anchor.url)) social[key] = anchor.url;
+          }
+        }
+        const emails = Array.from(new Set(allAnchors
+          .filter(a => a.url.startsWith("mailto:"))
+          .map(a => decodeURIComponent(a.url.slice(7).split("?")[0]))
+          .filter(Boolean))).slice(0, 5);
+        const phones = Array.from(new Set(allAnchors
+          .filter(a => a.url.startsWith("tel:"))
+          .map(a => decodeURIComponent(a.url.slice(4)).trim())
+          .filter(Boolean))).slice(0, 5);
+        const nav = Array.from(new Map(
+          Array.from(document.querySelectorAll<HTMLAnchorElement>("header a[href], nav a[href]"))
+            .map(a => ({ text: clean(a.innerText || a.getAttribute("aria-label") || ""), url: a.href }))
+            .filter(a => a.text && a.text.length <= 70 && /^https?:\/\//i.test(a.url))
+            .map(a => [a.text.toLowerCase(), a] as const)
+        ).values()).slice(0, 20).map(a => a.text);
+
+        const headingList = headings.slice(0, 40);
+        const siteName = metaAny("og:site_name") || metaAny("application-name");
+        const titleParts = title.split(/\s*[|–—•·]\s*|\s+-\s+/).map(part => part.trim()).filter(Boolean);
+        const name = clean(siteName) || titleParts[0] || "";
+        const tagline = metaAny("og:description") || clean(description) || headingList.find(h => h.level === 1)?.text || "";
+
+        const jsonLdEntities: Array<Record<string, any>> = [];
+        const walk = (value: unknown, depth = 0) => {
+          if (depth > 5 || !value || jsonLdEntities.length > 100) return;
+          if (Array.isArray(value)) { for (const item of value) walk(item, depth + 1); return; }
+          if (typeof value === "object") {
+            const obj = value as Record<string, any>;
+            jsonLdEntities.push(obj);
+            if (obj["@graph"]) walk(obj["@graph"], depth + 1);
+          }
+        };
+        walk(jsonLd);
+        const organization = jsonLdEntities.find(entity => {
+          const types = Array.isArray(entity["@type"]) ? entity["@type"] : [entity["@type"]];
+          return types.some((type: unknown) => typeof type === "string" && /Organization|LocalBusiness|Brand/i.test(type)) && entity.name;
+        });
+        const offers = jsonLdEntities
+          .filter(entity => entity.offers || /Product|Service|Offer/i.test(String(entity["@type"])))
+          .slice(0, 10)
+          .map(entity => ({
+            name: clean(entity.name || entity.headline || ""),
+            description: clean(entity.description || ""),
+            price: entity.offers ? clean(String(entity.offers.price ?? entity.offers.lowPrice ?? "")) : clean(String(entity.price ?? "")),
+            url: clean(entity.url || entity["@id"] || "")
+          }))
+          .filter(offer => offer.name);
+
+        brandInfo = {
+          name: clean(organization?.name) || name,
+          title,
+          description: clean(description),
+          tagline,
+          language: document.documentElement.lang || null,
+          logo_url: logo,
+          og_image: property("og:image"),
+          theme_color: metaAny("theme-color"),
+          colors,
+          fonts,
+          social_links: social,
+          emails,
+          phones,
+          nav,
+          headings: headingList,
+          offers,
+          image_count: imageCandidates.length
+        };
+      }
+
       return {
         title,
         description,
@@ -311,9 +501,10 @@ async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks
         json_ld: jsonLd,
         page_title: property("og:title") || title,
         og_image: property("og:image"),
-        robots: meta("robots")
+        robots: meta("robots"),
+        brand: brandInfo
       };
-    }, { maxText: maxTextChars, maxLinks });
+    }, { maxText: maxTextChars, maxLinks, brandMode });
 
     const finalUrl = page.url();
     // Validate the final URL too; don't return content after a redirect to a private host.
@@ -344,6 +535,7 @@ async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks
       images: extracted.images,
       buttons: extracted.buttons,
       structured_data: extracted.json_ld,
+      brand: extracted.brand ?? null,
       social_metadata: {
         og_title: extracted.page_title,
         og_image: extracted.og_image,
@@ -365,8 +557,9 @@ async function scrapeOne(rawUrl: string, maxTextChars = MAX_TEXT_CHARS, maxLinks
     return result;
   } finally {
     await context?.close().catch(() => {});
-    // Recycle periodically to reduce long-running memory growth.
-    if (browser && completedJobs > 0 && completedJobs % MAX_JOBS === 0) {
+    activePages = Math.max(0, activePages - 1);
+    // Recycle the browser only when nothing else is reading, to reduce long-running memory growth.
+    if (browser && activePages === 0 && completedJobs > 0 && completedJobs % MAX_JOBS === 0) {
       await browser.close().catch(() => {});
       browser = undefined;
     }
@@ -447,7 +640,7 @@ function scoreCandidate(rawUrl: string, anchor = "", source = "internal_link"): 
   try { u = new URL(rawUrl); } catch { return -1000; }
   const path = `${u.pathname} ${anchor}`.toLowerCase();
   if (/\.(?:png|jpe?g|gif|webp|svg|ico|pdf|zip|gz|css|js|map|woff2?|ttf|mp4|mp3|xml)$/i.test(u.pathname)) return -1000;
-  if (/\/(?:logout|log-out|signout|sign-out|unsubscribe|cart|checkout|account|login|signin|sign-in|register|search)(?:\/|$)/i.test(u.pathname)) return -500;
+  if (/\/(?:logout|log-out|signout|sign-out|unsubscribe|cart|checkout|account|my-account|login|signin|sign-in|signup|sign-up|register|forgot-password|reset-password|change-password|verify-email|confirm-email|magic-link|sso|oauth|callback|search)(?:\/|$)/i.test(u.pathname)) return -1000;
   if (/(?:^|[?&])(utm_|gclid|fbclid|sort=|filter=|page=)/i.test(u.search)) return -200;
   if (source === "start_url") return 1000;
   let score = source === "sitemap" ? 25 : 0;
@@ -711,60 +904,107 @@ async function crawlWebsite(
 
   emitProgress(null, "Starting site read…");
 
+  const pickBatch = (limit: number): CrawlCandidate[] => {
+    const batch: CrawlCandidate[] = [];
+    while (batch.length < limit && candidates.size > 0) {
+      let bestKey: string | null = null;
+      let bestEntry: CrawlCandidate | null = null;
+      for (const [key, entry] of candidates) {
+        if (visited.has(entry.url)) continue;
+        if (
+          !bestEntry ||
+          entry.score > bestEntry.score ||
+          (entry.score === bestEntry.score && entry.depth < bestEntry.depth)
+        ) {
+          bestKey = key;
+          bestEntry = entry;
+        }
+      }
+      if (!bestKey || !bestEntry) break;
+      candidates.delete(bestKey);
+      if (visited.has(bestEntry.url)) continue;
+      visited.add(bestEntry.url);
+      batch.push(bestEntry);
+    }
+    return batch;
+  };
+
   while (pages.length + failures.length < options.maxPages && candidates.size > 0) {
     if (Date.now() - started > options.maxDurationMs || totalChars >= options.maxTotalChars) {
       truncated = true;
       break;
     }
-    const next = [...candidates.values()].sort((a, b) => b.score - a.score || a.depth - b.depth)[0];
-    candidates.delete(next.url);
-    if (visited.has(next.url)) continue;
-    visited.add(next.url);
-    try {
-      emitProgress(next.url, `Reading ${next.url}`);
-      const result = await scrapeOne(next.url, Math.min(CRAWL_PAGE_TEXT_CHARS, options.maxTotalChars - totalChars), 150);
-      const finalUrl = normalizeCrawlUrl(String(result.url || next.url));
-      if (!finalUrl || !isSameSite(finalUrl, root)) {
-        failures.push({ url: next.url, error: "Redirected outside the allowed site; page was excluded." });
+    const remaining = options.maxPages - (pages.length + failures.length);
+    const batch = pickBatch(Math.min(CRAWL_CONCURRENCY, remaining));
+    if (!batch.length) break;
+    emitProgress(batch[0].url, batch.length === 1 ? `Reading ${batch[0].url}` : `Reading ${batch.length} pages in parallel`);
+
+    const settled = await Promise.all(
+      batch.map((candidate) =>
+        scrapeOne(candidate.url, Math.min(CRAWL_PAGE_TEXT_CHARS, Math.max(1_000, options.maxTotalChars - totalChars)), 150)
+          .then((result) => ({ candidate, result, error: null as string | null }))
+          .catch((error: unknown) => ({
+            candidate,
+            result: null,
+            error: (error instanceof Error ? error.message : String(error)).slice(0, 500),
+          })),
+      ),
+    );
+
+    const scrapedUrls = new Set(pages.map((page) => normalizeCrawlUrl(String(page.url))));
+    for (const item of settled) {
+      const { candidate, result, error } = item;
+      if (error || !result) {
+        failures.push({ url: candidate.url, error: error ?? "Unknown scraper error." });
         continue;
       }
-      const pageText = String(result.body_text || "").slice(0, Math.max(0, options.maxTotalChars - totalChars));
-      totalChars += pageText.length;
-      const pageType = classifyPage(finalUrl, String(result.title || ""), String(result.description || ""), (result.headings as Array<{text: string}>) || []);
-      const page: Record<string, any> = {
-        url: finalUrl,
-        requested_url: next.url,
-        status: result.status,
-        title: result.title,
-        description: result.description,
-        canonical_url: result.canonical_url,
-        language: result.language,
-        page_type: pageType,
-        priority_score: next.score,
-        depth: next.depth,
-        discovered_from: next.discovered_from,
-        headings: (result.headings as unknown[] || []).slice(0, 100),
-        body_text: pageText,
-        links: (result.links as unknown[] || []).slice(0, 100),
-        buttons: (result.buttons as unknown[] || []).slice(0, 30),
-        images: (result.images as unknown[] || []).slice(0, 30),
-        structured_data: result.structured_data || [],
-        social_metadata: result.social_metadata || {},
-        extraction: result.extraction || {}
-      };
-      page.content_markdown = `# ${page.title || finalUrl}\n\n${page.description ? `> ${page.description}\n\n` : ""}## Content\n${pageText}`;
-      pages.push(page);
-      for (const link of (result.links as Array<{url?: string; text?: string}> || [])) {
-        if (link.url) enqueue(link.url, next.depth + 1, "internal_link", link.text || "");
+      try {
+        const finalUrl = normalizeCrawlUrl(String(result.url || candidate.url));
+        if (!finalUrl || !isSameSite(finalUrl, root)) {
+          failures.push({ url: candidate.url, error: "Redirected outside the allowed site; page was excluded." });
+          continue;
+        }
+        if (scrapedUrls.has(finalUrl)) continue; // canonical/redirect duplicate already captured
+        scrapedUrls.add(finalUrl);
+        const pageText = String(result.body_text || "").slice(0, Math.max(0, options.maxTotalChars - totalChars));
+        totalChars += pageText.length;
+        const pageType = classifyPage(finalUrl, String(result.title || ""), String(result.description || ""), (result.headings as Array<{text: string}>) || []);
+        const page: Record<string, any> = {
+          url: finalUrl,
+          requested_url: candidate.url,
+          status: result.status,
+          title: result.title,
+          description: result.description,
+          canonical_url: result.canonical_url,
+          language: result.language,
+          page_type: pageType,
+          priority_score: candidate.score,
+          depth: candidate.depth,
+          discovered_from: candidate.discovered_from,
+          headings: (result.headings as unknown[] || []).slice(0, 100),
+          body_text: pageText,
+          links: (result.links as unknown[] || []).slice(0, 100),
+          buttons: (result.buttons as unknown[] || []).slice(0, 30),
+          images: (result.images as unknown[] || []).slice(0, 30),
+          structured_data: result.structured_data || [],
+          social_metadata: result.social_metadata || {},
+          extraction: result.extraction || {}
+        };
+        page.content_markdown = `# ${page.title || finalUrl}\n\n${page.description ? `> ${page.description}\n\n` : ""}## Content\n${pageText}`;
+        pages.push(page);
+        visited.add(finalUrl);
+        for (const link of (result.links as Array<{url?: string; text?: string}> || [])) {
+          if (link.url) enqueue(link.url, candidate.depth + 1, "internal_link", link.text || "");
+        }
+        if (totalChars >= options.maxTotalChars) truncated = candidates.size > 0;
+      } catch (err) {
+        failures.push({ url: candidate.url, error: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500) });
       }
-      // Don't let a redirect/canonical duplicate consume additional page slots.
-      visited.add(finalUrl);
-      emitProgress(null, `Read ${pages.length} page${pages.length !== 1 ? 's' : ''}`);
-      if (totalChars >= options.maxTotalChars) { truncated = candidates.size > 0; break; }
-    } catch (err) {
-      failures.push({ url: next.url, error: err instanceof Error ? err.message.slice(0, 500) : String(err).slice(0, 500) });
-      emitProgress(null, `Failed ${next.url}`);
     }
+
+    pages.sort((a, b) => (Number(b.priority_score) || 0) - (Number(a.priority_score) || 0));
+    emitProgress(null, `Read ${pages.length} page${pages.length !== 1 ? "s" : ""}${failures.length ? ` (${failures.length} skipped)` : ""}`);
+    if (totalChars >= options.maxTotalChars) break;
   }
   if (candidates.size > 0 && pages.length + failures.length >= options.maxPages) truncated = true;
 
@@ -826,6 +1066,225 @@ async function crawlWebsite(
   };
 }
 
+function brandLinkScore(anchor: string, rawUrl: string): number {
+  let url: URL;
+  try { url = new URL(rawUrl); } catch { return -1000; }
+  const path = url.pathname.toLowerCase();
+  const text = anchor.toLowerCase();
+  const joined = `${path} ${text}`;
+  if (/\.(?:png|jpe?g|gif|webp|svg|ico|pdf|zip|gz|css|js|map|woff2?|ttf|mp4|mp3|xml)$/i.test(path)) return -1000;
+  if (/\/(?:logout|log-out|signout|sign-out|unsubscribe|cart|checkout|account|my-account|login|signin|sign-in|signup|sign-up|register|forgot-password|reset-password|change-password|verify-email|confirm-email|magic-link|sso|oauth|callback|search)(?:\/|$)/i.test(path)) return -1000;
+  if (/\/(?:blog|news|articles?|resources|docs?|documentation|api|careers?|jobs?|legal|terms|privacy|cookies)(?:\/|$)/i.test(path)) return -500;
+  if (path === "/" || path === "") return -1000;
+  let score = 0;
+  if (/about|company|story|team|mission|who-we-are/.test(joined)) score += 100;
+  if (/product|service|feature|solution|platform|what-we-do|offer/.test(joined)) score += 80;
+  if (/pricing|plans|packages/.test(joined)) score += 60;
+  if (/contact|demo/.test(joined)) score += 20;
+  return score;
+}
+
+const GENERIC_BRAND_HEADING = /^(home|menu|close|search|sign in|log in|sign up|get started|learn more|contact|about|pricing|features|product|products|services|solutions|resources|blog|docs|support|faq|cookie|privacy|terms|accept|subscribe|newsletter)$/i;
+
+function brandOfferingsFromPages(pages: Array<Record<string, any>>): Array<{name: string; description: string; url: string | null}> {
+  const out: Array<{name: string; description: string; url: string | null}> = [];
+  const seen = new Set<string>();
+  for (const page of pages) {
+    const type = classifyPage(String(page.url || ""), String(page.title || ""), String(page.description || ""), (page.headings || []) as Array<{text: string}>);
+    if (!["product", "features", "pricing", "use_cases", "home"].includes(type)) continue;
+    for (const heading of (page.headings || []) as Array<{level: number; text: string}>) {
+      const text = String(heading.text || "").trim();
+      if (heading.level < 2 || heading.level > 3) continue;
+      if (text.length < 4 || text.length > 80 || GENERIC_BRAND_HEADING.test(text)) continue;
+      if (text.split(/\s+/).length > 10) continue;
+      const key = text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name: text, description: String(page.description || "").slice(0, 220), url: String(page.url || "") || null });
+      if (out.length >= 8) return out;
+    }
+  }
+  // Fall back to product/service/pricing links in the navigation.
+  for (const page of pages) {
+    const nav = Array.isArray(page.brand?.nav) ? page.brand.nav as string[] : [];
+    for (const label of nav) {
+      const text = String(label || "").trim();
+      if (!/product|service|feature|solution|plan|pricing|packages|shop|menu|course|program/i.test(text)) continue;
+      if (text.length < 3 || text.length > 60 || GENERIC_BRAND_HEADING.test(text)) continue;
+      const key = text.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({ name: text, description: "", url: String(page.url || "") || null });
+      if (out.length >= 8) return out;
+    }
+  }
+  return out;
+}
+
+async function extractBrandDetails(
+  rawUrl: string,
+  options: { maxPages: number; maxDurationMs: number },
+  onProgress?: (progress: CrawlProgress) => void
+) {
+  const root = await assertPublicHttpUrl(rawUrl);
+  const started = Date.now();
+  const maxPages = Math.max(1, Math.min(MAX_BRAND_PAGES, options.maxPages));
+
+  onProgress?.({ pages_found: 1, pages_processed: 0, current_page: root.toString(), percent: 5, message: `Reading ${root.hostname}` });
+  const home = await scrapeOne(root.toString(), 20_000, 200, true);
+  const pages: Array<Record<string, any>> = [home];
+
+  const candidates = new Map<string, { url: string; score: number }>();
+  for (const link of ((home.links as Array<{url?: string; text?: string}> | undefined) ?? [])) {
+    if (!link.url || !isSameSite(link.url, root)) continue;
+    const normalized = normalizeCrawlUrl(link.url);
+    if (!normalized || normalized === normalizeCrawlUrl(root.toString())) continue;
+    const score = brandLinkScore(link.text ?? "", normalized);
+    if (score < 1) continue;
+    const existing = candidates.get(normalized);
+    if (!existing || score > existing.score) candidates.set(normalized, { url: normalized, score });
+  }
+
+  const secondaries = [...candidates.values()].sort((a, b) => b.score - a.score).slice(0, Math.max(0, maxPages - 1));
+  if (secondaries.length && Date.now() - started < options.maxDurationMs) {
+    onProgress?.({ pages_found: pages.length + secondaries.length, pages_processed: pages.length, current_page: secondaries[0].url, percent: 20, message: `Reading ${secondaries.length} more page${secondaries.length === 1 ? "" : "s"} in parallel` });
+    const settled = await Promise.allSettled(secondaries.map((candidate) => scrapeOne(candidate.url, 8_000, 80, true)));
+    for (const item of settled) {
+      if (item.status === "fulfilled") pages.push(item.value);
+      else if (item.reason) { /* one weak secondary page must not fail the brand read */ }
+    }
+  }
+  onProgress?.({ pages_found: pages.length, pages_processed: pages.length, current_page: null, percent: 95, message: "Brand details ready" });
+
+  const brandOf = (page: Record<string, any>) => (page.brand ?? {}) as Record<string, any>;
+  const pick = (getter: (page: Record<string, any>) => unknown): string => {
+    for (const page of pages) {
+      const value = getter(page);
+      if (typeof value === "string" && value.trim()) return value.trim();
+    }
+    return "";
+  };
+  const stringList = (values: unknown[]): string[] =>
+    Array.from(new Set(values.filter((value): value is string => typeof value === "string" && value.trim().length > 0).map(value => value.trim())));
+
+  const name = pick(page => brandOf(page).name) || root.hostname.replace(/^www\./, "");
+  const description = pick(page => brandOf(page).description);
+  const tagline = pick(page => brandOf(page).tagline) || description;
+  const aboutPage = pages.find(page => classifyPage(String(page.url || ""), String(page.title || ""), String(page.description || ""), (page.headings || []) as Array<{text: string}>) === "about");
+  const aboutText = String(aboutPage?.body_text || home.body_text || "").slice(0, 6_000);
+  const colors = stringList(pages.flatMap(page => Array.isArray(brandOf(page).colors) ? brandOf(page).colors : [])).slice(0, 6);
+  const fonts = stringList(pages.flatMap(page => Array.isArray(brandOf(page).fonts) ? brandOf(page).fonts : [])).slice(0, 4);
+  const nav = stringList(pages.flatMap(page => Array.isArray(brandOf(page).nav) ? brandOf(page).nav : [])).slice(0, 20);
+  const emails = stringList(pages.flatMap(page => Array.isArray(brandOf(page).emails) ? brandOf(page).emails : [])).slice(0, 5);
+  const phones = stringList(pages.flatMap(page => Array.isArray(brandOf(page).phones) ? brandOf(page).phones : [])).slice(0, 5);
+  const social: Record<string, string> = {};
+  for (const page of pages) {
+    const links = brandOf(page).social_links;
+    if (!links || typeof links !== "object") continue;
+    for (const [key, value] of Object.entries(links as Record<string, unknown>)) {
+      if (!social[key] && typeof value === "string" && value.startsWith("http")) social[key] = value;
+    }
+  }
+  const images = pages.flatMap(page => Array.isArray(page.images) ? page.images : [])
+    .filter((image): image is {src: string; alt?: string} => Boolean(image && typeof image === "object" && typeof (image as any).src === "string"))
+    .slice(0, 30)
+    .map(image => ({ src: image.src, alt: image.alt ?? "" }));
+
+  const structured = summarizeStructuredData(pages as Array<Record<string, any>>);
+  const offerings = brandOfferingsFromPages(pages);
+  for (const entity of structured.entities) {
+    const types = Array.isArray(entity.types) ? entity.types as string[] : [];
+    const entityName = typeof entity.name === "string" ? entity.name.trim() : "";
+    if (!entityName || !types.some(type => /Product|Service|Offer/i.test(type))) continue;
+    if (offerings.some(offer => offer.name.toLowerCase() === entityName.toLowerCase())) continue;
+    offerings.push({
+      name: entityName.slice(0, 80),
+      description: typeof entity.description === "string" ? entity.description.slice(0, 220) : "",
+      url: typeof entity.url === "string" ? entity.url : null
+    });
+    if (offerings.length >= 8) break;
+  }
+
+  const headings = (home.headings as Array<{level: number; text: string}> | undefined ?? []).slice(0, 40);
+  const absUrl = (value: unknown, base: string): string | null => {
+    if (typeof value !== "string" || !value.trim()) return null;
+    try {
+      const resolved = new URL(value, base);
+      return resolved.protocol === "http:" || resolved.protocol === "https:" ? resolved.toString() : null;
+    } catch {
+      return null;
+    }
+  };
+  const absFromPages = (getter: (page: Record<string, any>) => unknown): string | null => {
+    for (const page of pages) {
+      const value = getter(page);
+      const resolved = absUrl(value, String(page.url || home.url));
+      if (resolved) return resolved;
+    }
+    return null;
+  };
+  const absoluteImages = images
+    .map((image) => ({ ...image, src: absUrl(image.src, root.toString()) ?? "" }))
+    .filter((image) => image.src);
+  let confidence = 0.35;
+  if (name && name.toLowerCase() !== root.hostname.replace(/^www\./, "").toLowerCase()) confidence += 0.15;
+  if (description) confidence += 0.15;
+  if (colors.length) confidence += 0.1;
+  if (fonts.length) confidence += 0.05;
+  if (offerings.length) confidence += 0.1;
+  if (pages.length > 1) confidence += 0.1;
+  confidence = Math.min(0.98, Number(confidence.toFixed(2)));
+
+  onProgress?.({ pages_found: pages.length, pages_processed: pages.length, current_page: null, percent: 100, message: "Brand details ready" });
+
+  return {
+    schema_version: "1.0",
+    url: String(home.url || root.toString()),
+    requested_url: root.toString(),
+    fetched_at: new Date().toISOString(),
+    brand: {
+      name,
+      title: String(home.title || ""),
+      description,
+      tagline,
+      one_liner: tagline || description,
+      language: pick(page => brandOf(page).language),
+      logo_url: absFromPages(page => brandOf(page).logo_url),
+      og_image: absFromPages(page => brandOf(page).og_image),
+      theme_color: pick(page => brandOf(page).theme_color) || null,
+      colors,
+      fonts,
+      social_links: social,
+      emails,
+      phones,
+      nav,
+      headings,
+      offerings: offerings.map(offer => ({ ...offer, url: offer.url ? absUrl(offer.url, root.toString()) : null })),
+      about_text: aboutText,
+      images: absoluteImages,
+      structured_data: structured,
+      confidence,
+      pages_read: pages.length
+    },
+    pages: pages.map(page => ({
+      url: String(page.url || ""),
+      title: String(page.title || ""),
+      description: String(page.description || ""),
+      page_type: classifyPage(String(page.url || ""), String(page.title || ""), String(page.description || ""), (page.headings || []) as Array<{text: string}>),
+      headings: (Array.isArray(page.headings) ? page.headings : []).slice(0, 30),
+      body_text: String(page.body_text || "").slice(0, 12_000),
+      images: (Array.isArray(page.images) ? page.images : []).slice(0, 30)
+    }))
+  };
+}
+
+function pruneBrandJobs() {
+  const finished = [...brandJobs.values()]
+    .filter(job => job.status === "completed" || job.status === "failed")
+    .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+  for (const job of finished.slice(MAX_BRAND_JOB_HISTORY)) brandJobs.delete(job.id);
+}
+
 function pruneCrawlJobs() {
   const finished = [...crawlJobs.values()].filter(j => j.status === "completed" || j.status === "failed")
     .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
@@ -840,6 +1299,78 @@ app.get("/health", async () => ({
   browser_started_at: browserStartedAt,
   completed_jobs: completedJobs
 }));
+
+app.post<{ Body: { url?: string; maxPages?: number; maxDurationMs?: number } }>("/brand", async (request, reply) => {
+  const body = request.body || {};
+  const url = body.url;
+  if (typeof url !== "string" || url.length > 2048) {
+    return reply.code(400).send({ error: "Provide a URL string up to 2048 characters." });
+  }
+  try { await assertPublicHttpUrl(url); }
+  catch (err) { return reply.code(400).send({ error: err instanceof Error ? err.message : "Invalid URL" }); }
+
+  const maxPages = Math.max(1, Math.min(MAX_BRAND_PAGES, Number.isFinite(body.maxPages) ? Math.floor(body.maxPages!) : MAX_BRAND_PAGES));
+  const maxDurationMs = Math.max(8_000, Math.min(MAX_BRAND_DURATION_MS, Number.isFinite(body.maxDurationMs) ? Math.floor(body.maxDurationMs!) : MAX_BRAND_DURATION_MS));
+  const activeBrands = [...brandJobs.values()].filter(job => job.status === "queued" || job.status === "running").length;
+  if (activeBrands >= MAX_BRAND_JOBS || queue.size + queue.pending >= 10) {
+    return reply.code(429).send({ error: "Brand read capacity is full; retry after a current job finishes." });
+  }
+
+  const id = randomUUID();
+  const now = new Date().toISOString();
+  const job: BrandJob = {
+    id, status: "queued", created_at: now, updated_at: now,
+    request: { url, max_pages: maxPages, max_duration_ms: maxDurationMs }
+  };
+  brandJobs.set(id, job);
+  pruneBrandJobs();
+  void queue.add(async () => {
+    job.status = "running";
+    job.updated_at = new Date().toISOString();
+    try {
+      job.result = await extractBrandDetails(url, { maxPages, maxDurationMs }, (progress) => {
+        job.progress = progress;
+        job.updated_at = new Date().toISOString();
+      });
+      job.status = "completed";
+    } catch (err) {
+      job.error = err instanceof Error ? err.message : String(err);
+      job.status = "failed";
+    } finally {
+      job.updated_at = new Date().toISOString();
+      pruneBrandJobs();
+    }
+  }).catch(err => {
+    job.status = "failed";
+    job.error = err instanceof Error ? err.message : String(err);
+    job.updated_at = new Date().toISOString();
+    pruneBrandJobs();
+  });
+
+  return reply.code(202).send({
+    job_id: id,
+    status: job.status,
+    status_url: `/brand/${id}`,
+    poll_interval_ms: 1000,
+    limits: job.request,
+    note: "Brand details are read from the homepage plus a few key pages, with bounded page and duration limits. Poll status_url until status is completed or failed."
+  });
+});
+
+app.get<{ Params: { id: string } }>("/brand/:id", async (request, reply) => {
+  const job = brandJobs.get(request.params.id);
+  if (!job) return reply.code(404).send({ error: "Brand job not found or expired. Jobs are stored in memory and may be lost after a service restart." });
+  return reply.send({
+    job_id: job.id,
+    status: job.status,
+    created_at: job.created_at,
+    updated_at: job.updated_at,
+    request: job.request,
+    ...(job.progress ? { progress: job.progress } : {}),
+    ...(job.error ? { error: job.error } : {}),
+    ...(job.result ? { result: job.result } : {})
+  });
+});
 
 app.post<{ Body: { url?: string; maxPages?: number; maxDepth?: number; maxDurationMs?: number; maxTotalChars?: number } }>("/crawl", async (request, reply) => {
   const body = request.body || {};

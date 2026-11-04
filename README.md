@@ -6,8 +6,22 @@ Node.js + TypeScript + Fastify + Playwright/Chromium. Designed to process one br
 
 - `GET /health` — queue/browser health.
 - `POST /scrape` — scrape one URL (existing behavior).
+- `POST /brand` — fast brand-only read (homepage + up to `maxPages` key pages). Returns a job id immediately.
+- `GET /brand/:job_id` — poll the brand read; the completed result contains name, tagline, description, logo, colors, fonts, social links, contact details, headings and offerings.
 - `POST /crawl` — asynchronously discover and crawl important pages from a website.
 - `GET /crawl/:job_id` — poll a crawl job; when complete, the response includes the full structured result.
+
+## Read brand details first
+
+Onboarding can call this immediately after the user enters a website, before the full crawl:
+
+```bash
+curl -sS -X POST 'https://YOUR-SERVICE.onrender.com/brand' \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com","maxPages":3}'
+```
+
+Poll `status_url` every second. A completed job returns a `brand` object with the identity and visual signals, plus the small set of pages that were read. This endpoint is intentionally shallow so the brand card can be filled in seconds; `POST /crawl` still runs afterwards for full evidence and grounding.
 
 ## Start a whole-site crawl
 
@@ -79,6 +93,10 @@ The included Dockerfile uses `mcr.microsoft.com/playwright:v1.64.1-noble`, insta
 - `MAX_CRAWL_DURATION_MS` default `180000`
 - `MAX_CRAWL_JOBS` default `3` active/queued crawls
 - `MAX_CRAWL_JOB_HISTORY` default `5` completed/failed job results retained in memory
+- `MAX_BRAND_PAGES` default `3` pages read by the fast brand pass
+- `MAX_BRAND_DURATION_MS` default `25000` time budget for the brand pass
+- `MAX_BRAND_JOBS` default `2` active/queued brand reads
+- `MAX_BRAND_JOB_HISTORY` default `6` completed/failed brand results retained in memory
 
 ## Safety and operational notes
 
